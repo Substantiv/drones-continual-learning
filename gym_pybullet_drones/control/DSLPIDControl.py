@@ -135,14 +135,14 @@ class DSLPIDControl(BaseControl):
                                                                          target_rpy,
                                                                          target_vel
                                                                          )
-        rpm = self._dslPIDAttitudeControl(control_timestep,
+        rpm, torques = self._dslPIDAttitudeControl(control_timestep,
                                           thrust,
                                           cur_quat,
                                           computed_target_rpy,
                                           target_rpy_rates
                                           )
         cur_rpy = p.getEulerFromQuaternion(cur_quat)
-        return rpm, pos_e, computed_target_rpy[2] - cur_rpy[2]
+        return rpm, pos_e, computed_target_rpy[2] - cur_rpy[2], thrust, torques
     
     ################################################################################
 
@@ -256,7 +256,7 @@ class DSLPIDControl(BaseControl):
         target_torques = np.clip(target_torques, -3200, 3200)
         pwm = thrust + np.dot(self.MIXER_MATRIX, target_torques)
         pwm = np.clip(pwm, self.MIN_PWM, self.MAX_PWM)
-        return self.PWM2RPM_SCALE * pwm + self.PWM2RPM_CONST
+        return self.PWM2RPM_SCALE * pwm + self.PWM2RPM_CONST, target_torques
     
     ################################################################################
 
@@ -285,3 +285,39 @@ class DSLPIDControl(BaseControl):
         else:
             print("[ERROR] in DSLPIDControl._one23DInterface()")
             exit()
+
+    def compute_label_data(self, data_cur, data_prev, thrust_prev, torque_prev, Ts, m, J):
+        # Generate the label data for network training using state
+        # measurement and APPLIED control inputs.
+        # Input argument:
+        # - data_cur: [x(k,3:end) eul(k,:) omega(k,:)] @ time (k)
+        # - data_prev: same as above but @ time (k-1)
+        # - thrust_prev: applied thrust f in (f * R * e3) @ time (k-1) (scalar) 
+        # - torque_prev: applied torque @ time (k-1) (1-by-3)
+        # Output argument:
+        # - aerodyn_pred: network prediction on aerodynamics @ time (k-1) (6-by-1)
+    
+        # Calculation: f_a[k-1] = m*( (v[k]-v[k-1])/Ts - g*e3 + 1/m*thrust_prev[k-1]*R*e3 )
+        R = self.rotation_matrix(data_prev[4], data_prev[5], data_prev[6])
+        e3 = np.array([0, 0, 1])
+        v_dot = (data_cur[1:4] - data_prev[1:4]) / Ts 
+        f_a = m * (v_dot - np.array([0, 0, 9.8]) + (thrust_prev / m) * np.dot(R, e3))
+        
+        # Calculation: tau_a[k-1] = J * (omega[k]-omega[k-1])/Ts - J omega[k-1] x omega[k-1] - tau_u[k-1]
+        omega_dot = (data_cur[7:10] - data_prev[7:10]) / Ts
+        skew_omega_prev = self.skew_symmetric(np.dot(J, data_prev[7:10]))
+        tau_a = np.dot(J, omega_dot) - np.dot(skew_omega_prev, data_prev[7:10]) - torque_prev
+        
+        aerodyn_pred = np.concatenate((f_a, tau_a))
+        
+        return aerodyn_pred
+    
+    def rotation_matrix(self, phi, theta, psi):
+        # Rotation matrix from body to inertial frame (3-2-1 convention)
+        R = np.array([
+            [np.cos(theta)*np.cos(psi), -np.cos(phi)*np.sin(psi) + np.sin(phi)*np.sin(theta)*np.cos(psi), np.sin(phi)*np.sin(psi) + np.cos(phi)*np.sin(theta)*np.cos(psi)],
+            [np.cos(theta)*np.sin(psi), np.cos(phi)*np.cos(psi) + np.sin(phi)*np.sin(theta)*np.sin(psi), -np.sin(phi)*np.cos(psi) + np.cos(phi)*np.sin(theta)*np.sin(psi)],
+            [-np.sin(theta), np.sin(phi)*np.cos(theta), np.cos(phi)*np.cos(theta)]
+        ])
+        return R
+    
